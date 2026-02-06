@@ -1,0 +1,106 @@
+############################################################
+# Kaplan-Meier Plot for SOD2
+# Bottom 25% vs Top 25% (Q25 vs Q75)
+############################################################
+
+rm(list=ls()); gc()
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(readxl)
+  library(survival)
+  library(survminer)
+})
+
+############################################################
+# PATHS
+############################################################
+sod2_file <- "TCGA_Q25Q75_patients_SOD2.tsv"
+cdr_xlsx  <- "TCGA-CDR-SupplementalTableS1.xlsx"
+
+############################################################
+# 1) Load SOD2
+############################################################
+dt_sod2 <- fread(sod2_file)
+dt_sod2[, patient := substr(patient, 1, 12)]
+
+stopifnot(
+  all(c("patient", "SOD2") %in% colnames(dt_sod2))
+)
+
+############################################################
+# 2) Load CDR survival (OS)
+############################################################
+cdr <- as.data.table(read_xlsx(cdr_xlsx))
+
+setnames(cdr,
+         old = c("bcr_patient_barcode", "OS.time", "OS"),
+         new = c("patient", "OS_time", "OS_event"),
+         skip_absent = TRUE)
+
+cdr[, patient := substr(patient, 1, 12)]
+
+############################################################
+# 3) Merge
+############################################################
+dt <- merge(dt_sod2, cdr[, .(patient, OS_time, OS_event)],
+            by = "patient", all = FALSE)
+
+dt <- dt[!is.na(OS_time) & !is.na(OS_event)]
+
+############################################################
+# 4) Build Q25 / Q75 groups
+############################################################
+
+# sort by SOD2
+setorder(dt, SOD2)
+
+n <- nrow(dt)
+q25_n <- floor(0.25 * n)
+
+dt_low25  <- dt[1:q25_n]
+dt_high25 <- dt[(n - q25_n + 1):n]
+
+dt_km <- rbind(
+  dt_low25[,  group := "SOD2_low_25pct"],
+  dt_high25[, group := "SOD2_high_25pct"]
+)
+
+message("KM group sizes:")
+print(table(dt_km$group))
+
+############################################################
+# 5) Survival object
+############################################################
+surv_obj <- Surv(
+  time  = dt_km$OS_time,
+  event = dt_km$OS_event
+)
+
+############################################################
+# 6) Fit KM
+############################################################
+fit <- survfit(surv_obj ~ group, data = dt_km)
+
+############################################################
+# 7) Plot
+############################################################
+p <- ggsurvplot(
+  fit,
+  data       = dt_km,
+  risk.table = TRUE,
+  pval       = TRUE,
+  conf.int  = FALSE,
+  legend.title = "SOD2 Groups",
+  legend.labs  = c("Bottom 25%", "Top 25%"),
+  palette = c("#2C7BB6", "#D7191C"),
+  xlab = "Time (days)",
+  ylab = "Overall Survival Probability",
+  title = "Kaplan-Meier: SOD2 (Bottom 25% vs Top 25%)"
+)
+
+print(p)
+
+############################################################
+# DONE
+############################################################

@@ -1,0 +1,98 @@
+# --- 0) Библиотеки ---
+required <- c("data.table", "dplyr", "tidyr", "ggplot2", "pheatmap")
+for(pkg in required) if(!require(pkg, character.only = TRUE)) install.packages(pkg)
+
+library(data.table)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(pheatmap)
+
+# --- 1) Загрузка ROS/MitoScore ---
+ros <- fread("ROS_MitoScores_ModelID.csv", header=TRUE)
+colnames(ros) <- c("DepMap_ID","ROS_MitoScore")
+
+# --- 2) Определяем Q1 и Q4 ---
+q1 <- quantile(ros$ROS_MitoScore, 0.25, na.rm=TRUE)
+q4 <- quantile(ros$ROS_MitoScore, 0.75, na.rm=TRUE)
+
+ros <- ros %>%
+  mutate(Group = case_when(
+    ROS_MitoScore <= q1 ~ "Low_Q1",
+    ROS_MitoScore >= q4 ~ "High_Q4",
+    TRUE ~ NA_character_
+  )) %>%
+  filter(!is.na(Group))  # оставляем только Q1 и Q4
+
+# --- 3) Загрузка CRISPR Gene Effect ---
+cr <- fread("CRISPRGeneEffect.csv", header=TRUE)
+colnames(cr)[1] <- "DepMap_ID"  # первая колонка — ID линии клеток
+
+# --- 4) Преобразуем в длинный формат ---
+cr_long <- cr %>%
+  pivot_longer(
+    cols = -DepMap_ID,
+    names_to = "Gene",
+    values_to = "Effect"
+  )
+
+# --- 5) Объединяем с ROS/MitoScore и усредняем дубликаты ---
+merged <- cr_long %>%
+  inner_join(ros, by="DepMap_ID") %>%
+  group_by(Gene, DepMap_ID, Group) %>%
+  summarise(Effect = mean(Effect, na.rm=TRUE), .groups="drop")
+
+# --- 6) Проверка количества линий по группам ---
+table(merged$Group)
+
+# --- 7) Средние эффекты по группе и разница ---
+summary_stats <- merged %>%
+  group_by(Gene, Group) %>%
+  summarise(meanEffect = mean(Effect, na.rm=TRUE), .groups="drop") %>%
+  pivot_wider(names_from=Group, values_from=meanEffect) %>%
+  filter(!is.na(Low_Q1) & !is.na(High_Q4)) %>%  # убираем NaN
+  mutate(
+    diff = High_Q4 - Low_Q1,
+    log2FC = log2((High_Q4 + 1e-6)/(Low_Q1 + 1e-6))
+  )
+
+# --- 8) Wilcoxon тест для каждого гена ---
+test_results <- merged %>%
+  group_by(Gene) %>%
+  summarise(
+    p_wilcoxon = wilcox.test(Effect ~ Group)$p.value,
+    .groups="drop"
+  )
+
+# --- 9) Объединяем результаты и корректируем p ---
+res <- summary_stats %>%
+  inner_join(test_results, by="Gene") %>%
+  mutate(adj_p = p.adjust(p_wilcoxon, method="BH")) %>%
+  arrange(adj_p)
+
+# --- 10) Сохраняем результаты ---
+fwrite(res, "CRISPR_dependency_ROS_Q1_vs_Q4.csv")
+
+# --- 11) Volcano plot ---
+volcano <- ggplot(res, aes(x=log2FC, y=-log10(adj_p))) +
+  geom_point(alpha=0.5) +
+  geom_hline(yintercept=-log10(0.05), color="red", linetype="dashed") +
+  geom_vline(xintercept=c(-0.5, 0.5), color="blue", linetype="dotted") +
+  theme_minimal() +
+  labs(
+    title="CRISPR dependency: High_Q4 vs Low_Q1 (ROS/Mito Score)",
+    x="log2(MeanEffect High_Q4 / MeanEffect Low_Q1)",
+    y="-log10(adj p)"
+  )
+ggsave("CRISPR_ROS_Q1Q4_volcano.png", plot = volcano, width=8, height=6, dpi=300)
+
+# --- 12) Heatmap топ-15 генов по значимости ---
+top15 <- res %>% slice(1:15) %>% pull(Gene)
+
+heat_data <- merged %>%
+  filter(Gene %in% top15) %>%
+  select(Gene, DepMap_ID, Effect) %>%
+  pivot_wider(names_from = DepMap_ID, values_from = Effect, values_fn = mean) %>%
+  column_to_rownames("Gene")
+
+pheatmap(heat_data, scale="row", clustering_method="ward.D2")

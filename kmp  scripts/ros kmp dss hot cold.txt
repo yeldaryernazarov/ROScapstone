@@ -1,0 +1,87 @@
+############################################################
+# Kaplan-Meier Plot for ROS (High vs Low)
+# Separate plots for Hot vs Cold patients
+# Uses median split to get equal number of patients
+############################################################
+
+rm(list=ls()); gc()
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(survival)
+  library(survminer)
+})
+
+############################################################
+# PATHS
+############################################################
+merged_file <- "TCGA_patients_ROS_ESTIMATE.tsv"
+cdr_xlsx   <- "TCGA-CDR-SupplementalTableS1.xlsx"
+
+############################################################
+# 1) Load merged data
+############################################################
+dt <- fread(merged_file)
+dt[, patient := substr(patient, 1, 12)]
+
+stopifnot(all(c("patient", "ROS_ssGSEA", "ROS_status", "ImmuneStatus") %in% colnames(dt)))
+
+############################################################
+# 2) Load CDR survival (DSS)
+############################################################
+cdr <- as.data.table(readxl::read_xlsx(cdr_xlsx))
+setnames(cdr,
+         old = c("bcr_patient_barcode", "DSS.time", "DSS"),
+         new = c("patient", "DSS_time", "DSS_event"),
+         skip_absent = TRUE)
+cdr[, patient := substr(patient, 1, 12)]
+
+# Merge DSS
+dt <- merge(dt, cdr[, .(patient, DSS_time, DSS_event)], by = "patient", all.x = TRUE)
+dt <- dt[!is.na(DSS_time) & !is.na(DSS_event)]
+
+############################################################
+# 3) Assign ROS High / Low groups using median (within each ImmuneStatus)
+############################################################
+dt[, ROS_group := {
+  med <- median(ROS_ssGSEA, na.rm = TRUE)
+  fifelse(ROS_ssGSEA <= med, "ROS_Low", "ROS_High")
+}, by = ImmuneStatus]
+
+dt_km <- dt[!is.na(ROS_group)]
+message("KM group sizes per ImmuneStatus:")
+print(table(dt_km$ImmuneStatus, dt_km$ROS_group))
+
+############################################################
+# 4) Fit KM & plot per ImmuneStatus
+############################################################
+plot_list <- list()
+
+for(status in unique(dt_km$ImmuneStatus)) {
+  
+  dt_sub <- dt_km[ImmuneStatus == status]
+  surv_obj <- Surv(time = dt_sub$DSS_time, event = dt_sub$DSS_event)
+  
+  fit <- survfit(surv_obj ~ ROS_group, data = dt_sub)
+  
+  p <- ggsurvplot(
+    fit,
+    data       = dt_sub,
+    risk.table = TRUE,
+    pval       = TRUE,
+    conf.int   = FALSE,
+    legend.title = paste0("ROS Groups (", status, ")"),
+    legend.labs  = c("Low", "High"),
+    palette = c("#2C7BB6", "#D7191C"),
+    xlab = "Time (days)",
+    ylab = "Disease-Specific Survival Probability",
+    title = paste0("Kaplan-Meier: ROS (Low vs High, DSS) - ", status)
+  )
+  
+  print(p)
+  plot_list[[status]] <- p
+}
+
+############################################################
+# DONE
+############################################################

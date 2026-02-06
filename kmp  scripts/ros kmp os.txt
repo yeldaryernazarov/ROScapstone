@@ -1,0 +1,103 @@
+############################################################
+# Kaplan-Meier Plot for ROS
+# Q25 (Low 25%) vs Q75 (High 25%)
+############################################################
+
+rm(list=ls()); gc()
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(readxl)
+  library(survival)
+  library(survminer)
+})
+
+############################################################
+# PATHS
+############################################################
+ros_file <- "TCGA_Q25Q75_patients_ROS_ssGSEA.tsv"
+cdr_xlsx <- "TCGA-CDR-SupplementalTableS1.xlsx"
+
+############################################################
+# 1) Load ROS
+############################################################
+dt_ros <- fread(ros_file)
+dt_ros[, patient := substr(patient, 1, 12)]
+
+stopifnot(
+  all(c("patient", "ROS_ssGSEA") %in% colnames(dt_ros))
+)
+
+############################################################
+# 2) Load CDR survival (OS)
+############################################################
+cdr <- as.data.table(read_xlsx(cdr_xlsx))
+
+# Standard TCGA columns
+setnames(cdr,
+         old = c("bcr_patient_barcode", "OS.time", "OS"),
+         new = c("patient", "OS_time", "OS_event"),
+         skip_absent = TRUE)
+
+cdr[, patient := substr(patient, 1, 12)]
+
+############################################################
+# 3) Merge
+############################################################
+dt <- merge(dt_ros, cdr[, .(patient, OS_time, OS_event)],
+            by = "patient", all = FALSE)
+
+# keep valid OS only
+dt <- dt[!is.na(OS_time) & !is.na(OS_event)]
+
+############################################################
+# 4) Build Q25 / Q75 groups
+############################################################
+
+# вычисляем квартили
+q <- quantile(dt$ROS_ssGSEA, probs = c(0.25, 0.75), na.rm = TRUE)
+
+# выбираем нижние 25% и верхние 25%
+dt_km <- dt[ROS_ssGSEA <= q[1] | ROS_ssGSEA >= q[2]]
+
+# присваиваем группы
+dt_km[, group := ifelse(ROS_ssGSEA <= q[1], "ROS_Low25", "ROS_High25")]
+
+message("KM group sizes:")
+print(table(dt_km$group))
+
+############################################################
+# 5) Survival object
+############################################################
+surv_obj <- Surv(
+  time  = dt_km$OS_time,
+  event = dt_km$OS_event
+)
+
+############################################################
+# 6) Fit KM
+############################################################
+fit <- survfit(surv_obj ~ group, data = dt_km)
+
+############################################################
+# 7) Plot
+############################################################
+p <- ggsurvplot(
+  fit,
+  data       = dt_km,
+  risk.table = TRUE,
+  pval       = TRUE,
+  conf.int   = FALSE,
+  legend.title = "ROS Groups",
+  legend.labs  = c("Low 25%", "High 25%"),
+  palette = c("#2C7BB6", "#D7191C"),
+  xlab = "Time (days)",
+  ylab = "Overall Survival Probability",
+  title = "Kaplan-Meier: ROS (Q25 vs Q75)"
+)
+
+print(p)
+
+############################################################
+# DONE
+############################################################
