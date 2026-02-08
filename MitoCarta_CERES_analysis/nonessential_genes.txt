@@ -1,0 +1,2 @@
+# One gene symbol per line. Reference non-essential genes (e.g. from Hart et al. or DepMap).
+# If empty, NonEssentialScore will be 0 for all samples.
