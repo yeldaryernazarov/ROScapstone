@@ -68,26 +68,56 @@ if (length(nonessential_genes) == 0) {
 }
 
 # -----------------------------
-# Load expression matrix (genes = rownames or first column, samples = columns)
+# Load expression matrix and map genes to HUGO symbols (like ssGSEA script)
 # -----------------------------
 cat("Loading expression...\n")
 expr <- fread(EXPR_FILE)
+cat("Expression dimensions (rows x cols):", dim(expr), "\n")
 
-# Detect layout: if first column name is "Gene" or looks like IDs, use as gene IDs
-first_col <- names(expr)[1]
-if (tolower(first_col) %in% c("gene", "symbol", "gene_symbol", "geneid")) {
-  gene_col <- first_col
-  sample_cols <- setdiff(names(expr), gene_col)
-  mat <- as.matrix(expr[, ..sample_cols])
-  rownames(mat) <- as.character(expr[[gene_col]])
+# In OmicsExpressionTPMLogp1HumanProteinCodingGenes.csv:
+#  - Rows are samples
+#  - First 4 columns are metadata
+#  - Remaining columns are genes like 'GENE (1234)' where 1234 is EntrezID
+expr_mat <- as.matrix(expr[, -c(1:4), with = FALSE])
+expr_mat <- apply(expr_mat, 2, function(x) as.numeric(as.character(x)))
+cat("Converted expr to numeric matrix. NA count:", sum(is.na(expr_mat)), "\n")
+
+# Use SampleID (second column) as sample identifier if present, otherwise first column
+sample_id_col <- if ("SampleID" %in% names(expr)) {
+  "SampleID"
 } else {
-  # Assume rows are genes (first column is gene ID)
-  mat <- as.matrix(expr[, -1, with = FALSE])
-  rownames(mat) <- as.character(expr[[1]])
+  names(expr)[2]
 }
-mat <- apply(mat, 2, as.numeric)
+rownames(expr_mat) <- as.character(expr[[sample_id_col]])
+
+# Parse Entrez IDs from column names and map to HUGO, exactly as in ssGSEA pipeline
+gene_names <- colnames(expr_mat)
+entrez_ids <- sub(".*\\((\\d+)\\)$", "\\1", gene_names)
+
+if (file.exists("uniprot_hugo_entrez_id_mapping.csv")) {
+  map <- fread("uniprot_hugo_entrez_id_mapping.csv")
+  map <- map[!is.na(EntrezID) & !is.na(Symbol)]
+  hugo_symbols <- map$Symbol[match(entrez_ids, map$EntrezID)]
+  hugo_symbols <- toupper(hugo_symbols)
+  colnames(expr_mat) <- hugo_symbols
+} else {
+  # Fallback: strip trailing '(1234)' and upper-case
+  colnames(expr_mat) <- toupper(gsub("\\s*\\(.*\\)$", "", gene_names))
+}
+
+# Drop unmapped / empty gene columns
+valid_cols <- !is.na(colnames(expr_mat)) & colnames(expr_mat) != ""
+expr_mat <- expr_mat[, valid_cols, drop = FALSE]
+
+# Drop all-zero genes (never expressed)
+nonzero_cols <- colSums(expr_mat, na.rm = TRUE) > 0
+expr_mat <- expr_mat[, nonzero_cols, drop = FALSE]
+cat("Columns after mapping and filtering:", ncol(expr_mat), "\n")
+
+# Transpose to genes x samples for downstream per-gene Z-scores
+mat <- t(expr_mat)
 rownames(mat) <- make.unique(rownames(mat))
-cat("Expression: ", nrow(mat), "genes x ", ncol(mat), "samples\n")
+cat("Expression matrix (genes x samples):", nrow(mat), "x", ncol(mat), "\n")
 
 # -----------------------------
 # 1) log2(TPM + 1) if not already
