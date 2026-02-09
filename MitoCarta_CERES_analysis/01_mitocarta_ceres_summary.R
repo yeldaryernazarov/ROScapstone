@@ -80,6 +80,37 @@ storage.mode(ceres_mat) <- "numeric"
 cat("CERES dimensions: ", nrow(ceres_mat), "lines x ", ncol(ceres_mat), "genes\n")
 
 # -----------------------------
+# 2b) Normalize CERES gene identifiers to HUGO symbols (upper case)
+#     This makes them comparable to MitoCarta symbols.
+# -----------------------------
+genes_raw <- colnames(ceres_mat)
+
+# If columns look like 'GENE (1234)', keep only the gene symbol part
+genes_sym <- toupper(gsub("\\s*\\(.*\\)$", "", genes_raw))
+
+# If columns look like Entrez IDs, try mapping Entrez -> HUGO using the same map
+only_digits <- grepl("^[0-9]+$", genes_sym)
+if (any(only_digits) && file.exists("uniprot_hugo_entrez_id_mapping.csv")) {
+  map <- fread("uniprot_hugo_entrez_id_mapping.csv")
+  map <- map[!is.na(EntrezID) & !is.na(Symbol)]
+  # EntrezID in the mapping is numeric with .0, convert to integer-like character
+  map$EntrezID_chr <- as.character(as.integer(map$EntrezID))
+
+  genes_entrez <- genes_sym
+  genes_entrez[!only_digits] <- NA_character_
+
+  hugo_from_entrez <- map$Symbol[match(genes_entrez, map$EntrezID_chr)]
+
+  # Where mapping succeeds, replace with HUGO symbols
+  replace_idx <- which(!is.na(hugo_from_entrez))
+  if (length(replace_idx) > 0) {
+    genes_sym[replace_idx] <- toupper(hugo_from_entrez[replace_idx])
+  }
+}
+
+colnames(ceres_mat) <- genes_sym
+
+# -----------------------------
 # 3) Restrict to MitoCarta genes present in CERES
 # -----------------------------
 genes_in_ceres <- colnames(ceres_mat)

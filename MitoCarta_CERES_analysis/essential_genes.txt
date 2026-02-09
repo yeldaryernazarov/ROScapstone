@@ -1,6 +1,24 @@
 # One gene symbol per line (lines starting with # are ignored).
 # Example: use MitoCarta genes or a custom essential set.
 # If this file is empty and Human.MitoCarta3.0.xlsx exists, script 03 will use MitoCarta.
-# SOD2
-# COX4I1
-# NDUFS1
+SOD2
+NDUFS1
+DNA2
+NDUFB1
+SDHB
+GPX4
+TXNRD1
+AIFM1
+EARS2
+FPGS
+MRPL15
+MICOS10
+MCL1
+ACO2
+PAICS
+NDUFA8
+MRPL18
+FARS2
+HARS2
+MRPS6
+DNAJC11
