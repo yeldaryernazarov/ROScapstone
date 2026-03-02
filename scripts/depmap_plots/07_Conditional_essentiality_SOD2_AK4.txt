@@ -1,0 +1,162 @@
+############################################################
+# 7) Conditional Essentiality: SOD2 / AK4
+#    - Split cell lines by ROS_MitoScore (Q1 vs Q4)
+#    - Compare CERES scores for SOD2 and AK4 between groups
+#    - Output stats table + boxplot
+############################################################
+
+rm(list = ls()); gc()
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(tibble)
+})
+
+############################################################
+# PATHS (edit if needed)
+############################################################
+
+CERES_FILE <- "CRISPRGeneEffect.csv"        # DepMap CERES matrix
+ROS_FILE   <- "ROS_MitoScores_ModelID.csv"  # DepMap_ID, ROS_MitoScore
+OUTDIR     <- "RESULTS"
+
+dir.create(OUTDIR, showWarnings = FALSE)
+
+############################################################
+# 1) Parameters
+############################################################
+
+genes_of_interest <- c("SOD2", "AK4")
+
+############################################################
+# 2) Load ROS scores and define High / Low groups
+############################################################
+
+ros <- fread(ROS_FILE, header = TRUE)
+colnames(ros) <- c("DepMap_ID", "ROS_MitoScore")
+
+q1 <- quantile(ros$ROS_MitoScore, 0.25, na.rm = TRUE)
+q4 <- quantile(ros$ROS_MitoScore, 0.75, na.rm = TRUE)
+
+ros <- ros %>%
+  mutate(
+    Group = case_when(
+      ROS_MitoScore <= q1 ~ "Low_Q1",
+      ROS_MitoScore >= q4 ~ "High_Q4",
+      TRUE                ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(Group))
+
+############################################################
+# 3) Load CERES dependency data
+############################################################
+
+ceres_raw <- fread(CERES_FILE)
+
+# Assume: 1st column = cell line identifier (DepMap_ID or name), rest = genes
+id_col <- names(ceres_raw)[1]
+ceres_mat <- as.matrix(ceres_raw[, -1, with = FALSE])
+rownames(ceres_mat) <- ceres_raw[[id_col]]
+colnames(ceres_mat) <- names(ceres_raw)[-1]
+
+# Heuristic: if more rows than columns, file is genes × lines → transpose
+if (nrow(ceres_mat) > ncol(ceres_mat)) {
+  ceres_mat <- t(ceres_mat)
+  message("Transposed CERES so that rows = cell lines, columns = genes.")
+}
+
+# Normalize gene identifiers to upper‑case HUGO-like symbols
+genes_raw <- colnames(ceres_mat)
+genes_sym <- toupper(gsub("\\s*\\(.*\\)$", "", genes_raw))
+colnames(ceres_mat) <- genes_sym
+storage.mode(ceres_mat) <- "numeric"
+
+ceres <- as.data.frame(ceres_mat) %>%
+  rownames_to_column("DepMap_ID")
+
+# Make sure genes of interest use the same formatting
+genes_of_interest <- toupper(genes_of_interest)
+
+ceres_long <- ceres %>%
+  pivot_longer(
+    cols = -DepMap_ID,
+    names_to = "Gene",
+    values_to = "CERES"
+  )
+
+############################################################
+# 4) Merge CERES with ROS groups and subset to SOD2 / AK4
+############################################################
+
+merged <- ceres_long %>%
+  inner_join(ros, by = "DepMap_ID") %>%
+  filter(Gene %in% genes_of_interest)
+
+merged$Gene  <- factor(merged$Gene,  levels = genes_of_interest)
+merged$Group <- factor(merged$Group, levels = c("Low_Q1", "High_Q4"))
+
+############################################################
+# 5) Statistics: conditional essentiality per gene
+############################################################
+
+stats_df <- merged %>%
+  group_by(Gene) %>%
+  summarize(
+    n_Low   = sum(Group == "Low_Q1"),
+    n_High  = sum(Group == "High_Q4"),
+    mean_Low  = mean(CERES[Group == "Low_Q1"],  na.rm = TRUE),
+    mean_High = mean(CERES[Group == "High_Q4"], na.rm = TRUE),
+    diff       = mean_High - mean_Low,  # High_Q4 - Low_Q1
+    p_wilcox   = tryCatch(
+      wilcox.test(CERES ~ Group)$p.value,
+      error = function(e) NA_real_
+    ),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    adj_p = p.adjust(p_wilcox, method = "BH")
+  )
+
+fwrite(
+  stats_df,
+  file = file.path(OUTDIR, "Conditional_essentiality_SOD2_AK4_ROS_Q1Q4.tsv"),
+  sep  = "\t"
+)
+
+############################################################
+# 6) Boxplot: CERES by ROS group for SOD2 / AK4
+############################################################
+
+if (nrow(merged) == 0) {
+  warning("No data for selected genes / ROS groups after merging; boxplot not created.")
+} else {
+  p_box <- ggplot(merged, aes(x = Group, y = CERES, fill = Group)) +
+    geom_boxplot(outlier.size = 0.6, alpha = 0.8) +
+    facet_wrap(~ Gene, nrow = 1, scales = "free_y") +
+    scale_fill_manual(values = c("Low_Q1" = "#2C7BB6", "High_Q4" = "#D7191C")) +
+    theme_minimal(base_size = 12) +
+    labs(
+      title = "Conditional essentiality of SOD2 / AK4\nROS Low_Q1 vs High_Q4 cell lines",
+      x     = "ROS group",
+      y     = "CERES score",
+      fill  = "ROS group"
+    )
+
+  ggsave(
+    filename = file.path(OUTDIR, "Fig_Conditional_essentiality_SOD2_AK4_ROS_Q1Q4.png"),
+    plot     = p_box,
+    width    = 7,
+    height   = 4.5,
+    dpi      = 300
+  )
+}
+
+############################################################
+# DONE
+############################################################
+message("Conditional essentiality (SOD2 / AK4) analysis finished. Stats and plot saved in RESULTS.")
+

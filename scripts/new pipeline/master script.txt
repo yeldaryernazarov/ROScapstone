@@ -1,0 +1,383 @@
+############################################################
+# MASTER PIPELINE
+# TCGA (ROS ssGSEA / SOD2 / ESTIMATE / DSS)
+# + DepMap (RNA / CERES / Drugs / FGSEA)
+############################################################
+
+rm(list = ls()); gc()
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(readxl)
+  library(dplyr)
+  library(tidyr)
+  library(survival)
+  library(survminer)
+  library(ggplot2)
+  library(fgsea)
+  library(msigdbr)
+  library(pheatmap)
+})
+
+set.seed(42)
+dir.create("RESULTS", showWarnings = FALSE)
+
+############################################################
+# PATHS
+############################################################
+
+# ===== TCGA =====
+ROS_FILE      <- "TCGA_Q25Q75_patients_ROS_ssGSEA.tsv"
+ESTIMATE_FILE <- "TCGA_ESTIMATE_all_patients.tsv"
+CLINICAL_XLSX <- "TCGA-CDR-SupplementalTableS1.xlsx"
+
+# Optional SOD2 file (patient + SOD2 column)
+SOD2_FILE     <- NULL
+SOD2_COL      <- "SOD2"
+
+# ===== DEPMAP =====
+DEPMAP_EXPR   <- "OmicsExpressionTPMLogp1HumanProteinCodingGenes.csv"
+CERES_FILE   <- "CRISPRGeneEffect.csv"
+DRUG_FILE    <- "Repurposing_Public_24Q2_Extended_Primary_Data_Matrix.csv"
+MODEL_FILE   <- "Model.csv"
+
+# ===== OUTPUT =====
+OUTDIR <- "RESULTS"
+
+############################################################
+# ROS SIGNATURE
+############################################################
+ROS_GENES <- c(
+  "SOD2","SOD1","CAT","GPX1","GPX4","PRDX1","PRDX3",
+  "TXN","TXNRD1","GSR","NFE2L2","KEAP1","NOX4",
+  "UQCRB","NDUFS1","COX4I1"
+)
+
+############################################################
+# UTILITIES
+############################################################
+log_msg <- function(x) {
+  cat("[", format(Sys.time(), "%H:%M:%S"), "] ", x, "\n")
+}
+
+############################################################
+# SCORE + GROUPING
+############################################################
+calc_score_expr <- function(expr, genes) {
+  genes <- intersect(genes, expr$Gene)
+  mat <- expr %>%
+    filter(Gene %in% genes) %>%
+    column_to_rownames("Gene") %>%
+    as.matrix()
+
+  mat_z <- t(scale(t(mat)))
+  score <- colMeans(mat_z, na.rm = TRUE)
+
+  data.frame(ID = names(score), Score = score)
+}
+
+make_groups <- function(df) {
+  q1 <- quantile(df$Score, 0.25, na.rm = TRUE)
+  q4 <- quantile(df$Score, 0.75, na.rm = TRUE)
+
+  df$Group <- "Mid"
+  df$Group[df$Score <= q1] <- "Low"
+  df$Group[df$Score >= q4] <- "High"
+
+  df %>% filter(Group != "Mid")
+}
+
+############################################################
+# KM FUNCTION (Q25 vs Q75 DSS)
+############################################################
+plot_km_q25q75 <- function(score_file,
+                           score_col,
+                           cdr_xlsx,
+                           label,
+                           out_png = NULL) {
+
+  log_msg(paste("KM:", label))
+
+  dt_score <- fread(score_file)
+  stopifnot(all(c("patient", score_col) %in% colnames(dt_score)))
+
+  dt_score[, patient := substr(patient, 1, 12)]
+
+  cdr <- as.data.table(read_xlsx(cdr_xlsx))
+
+  setnames(cdr,
+           old = c("bcr_patient_barcode", "DSS.time", "DSS"),
+           new = c("patient", "DSS_time", "DSS_event"),
+           skip_absent = TRUE)
+
+  cdr[, patient := substr(patient, 1, 12)]
+
+  dt <- merge(dt_score,
+              cdr[, .(patient, DSS_time, DSS_event)],
+              by = "patient", all = FALSE)
+
+  dt <- dt[!is.na(DSS_time) & !is.na(DSS_event)]
+
+  q <- quantile(dt[[score_col]], probs = c(0.25, 0.75), na.rm = TRUE)
+
+  dt_km <- dt[
+    get(score_col) <= q[1] | get(score_col) >= q[2]
+  ]
+
+  dt_km[, group := ifelse(
+    get(score_col) <= q[1],
+    paste0(label, "_Low25"),
+    paste0(label, "_High25")
+  )]
+
+  print(table(dt_km$group))
+
+  surv_obj <- Surv(
+    time  = dt_km$DSS_time,
+    event = dt_km$DSS_event
+  )
+
+  fit <- survfit(surv_obj ~ group, data = dt_km)
+
+  p <- ggsurvplot(
+    fit,
+    data       = dt_km,
+    risk.table = TRUE,
+    pval       = TRUE,
+    conf.int  = FALSE,
+    legend.title = paste(label, "Groups"),
+    legend.labs  = c("Low 25%", "High 25%"),
+    palette = c("#2C7BB6", "#D7191C"),
+    xlab = "Time (days)",
+    ylab = "Disease-Specific Survival Probability",
+    title = paste("Kaplan-Meier:", label, "(Q25 vs Q75, DSS)")
+  )
+
+  print(p)
+
+  if (!is.null(out_png)) {
+    ggsave(out_png, p$plot, width = 6, height = 5)
+  }
+
+  invisible(dt_km)
+}
+
+############################################################
+# CERES STATS
+############################################################
+wilcox_by_gene <- function(long_df, value_col) {
+  long_df %>%
+    group_by(Gene) %>%
+    summarize(
+      Mean_High = mean(.data[[value_col]][Group == "High"], na.rm = TRUE),
+      Mean_Low  = mean(.data[[value_col]][Group == "Low"],  na.rm = TRUE),
+      Delta = Mean_High - Mean_Low,
+      P = wilcox.test(
+        .data[[value_col]][Group == "High"],
+        .data[[value_col]][Group == "Low"]
+      )$p.value
+    ) %>%
+    mutate(FDR = p.adjust(P, "fdr")) %>%
+    arrange(FDR)
+}
+
+############################################################
+# ======================
+# PART A — TCGA
+# ======================
+############################################################
+
+log_msg("Loading TCGA files...")
+
+tcga_ros <- fread(ROS_FILE)
+tcga_ros[, patient := substr(patient, 1, 12)]
+
+tcga_est <- fread(ESTIMATE_FILE)
+tcga_est[, patient := substr(patient, 1, 12)]
+
+cdr <- as.data.table(read_xlsx(CLINICAL_XLSX))
+setnames(cdr,
+         old = c("bcr_patient_barcode", "DSS.time", "DSS"),
+         new = c("patient", "DSS_time", "DSS_event"),
+         skip_absent = TRUE)
+cdr[, patient := substr(patient, 1, 12)]
+
+############################################################
+# MERGE TCGA FULL TABLE
+############################################################
+log_msg("Merging TCGA tables...")
+
+tcga_full <- merge(tcga_ros, tcga_est, by = "patient", all = FALSE)
+tcga_full <- merge(tcga_full,
+                    cdr[, .(patient, DSS_time, DSS_event)],
+                    by = "patient", all = FALSE)
+
+tcga_full <- tcga_full[!is.na(DSS_time) & !is.na(DSS_event)]
+
+fwrite(tcga_full,
+       file.path(OUTDIR, "TCGA_ROS_ESTIMATE_CDR_merged.tsv"),
+       sep = "\t")
+
+############################################################
+# TCGA IMMUNE ASSOCIATION
+############################################################
+log_msg("ImmuneScore association...")
+
+q <- quantile(tcga_full$ROS_ssGSEA, probs = c(0.25, 0.75), na.rm = TRUE)
+tcga_imm <- tcga_full[
+  ROS_ssGSEA <= q[1] | ROS_ssGSEA >= q[2]
+]
+tcga_imm[, Group := ifelse(
+  ROS_ssGSEA <= q[1], "Low", "High"
+)]
+
+w <- wilcox.test(ImmuneScore ~ Group, tcga_imm)
+
+write.table(
+  data.frame(Test = "ROS_vs_ImmuneScore", P = w$p.value),
+  file = file.path(OUTDIR, "TCGA_ImmuneStats.tsv"),
+  sep = "\t", row.names = FALSE, col.names = TRUE
+)
+
+############################################################
+# TCGA KM PLOTS
+############################################################
+log_msg("TCGA KM ROS...")
+plot_km_q25q75(
+  ROS_FILE,
+  "ROS_ssGSEA",
+  CLINICAL_XLSX,
+  "ROS",
+  file.path(OUTDIR, "Fig_TCGA_ROS_DSS.png")
+)
+
+if (!is.null(SOD2_FILE)) {
+  log_msg("TCGA KM SOD2...")
+  plot_km_q25q75(
+    SOD2_FILE,
+    SOD2_COL,
+    CLINICAL_XLSX,
+    "SOD2",
+    file.path(OUTDIR, "Fig_TCGA_SOD2_DSS.png")
+  )
+}
+
+############################################################
+# ======================
+# PART B — DEPMAP
+# ======================
+############################################################
+
+log_msg("Loading DepMap data...")
+
+dep_expr <- fread(DEPMAP_EXPR)
+ceres    <- fread(CERES_FILE)
+drugs    <- fread(DRUG_FILE)
+model    <- fread(MODEL_FILE)
+
+############################################################
+# DEPMAP ROS SCORE
+############################################################
+log_msg("Scoring DepMap ROS...")
+
+dep_ros <- calc_score_expr(dep_expr, ROS_GENES)
+dep_ros <- make_groups(dep_ros)
+
+############################################################
+# CERES ANALYSIS
+############################################################
+log_msg("Running CERES differential dependency...")
+
+ceres_long <- ceres %>%
+  pivot_longer(-Gene, names_to = "ID", values_to = "CERES") %>%
+  inner_join(dep_ros, by = c("ID" = "ID"))
+
+ceres_stats <- wilcox_by_gene(ceres_long, "CERES")
+
+fwrite(ceres_stats,
+       file.path(OUTDIR, "Fig_CERES_ROS_dependencies.tsv"),
+       sep = "\t")
+
+############################################################
+# DRUG SENSITIVITY
+############################################################
+log_msg("Running drug sensitivity...")
+
+drug_long <- drugs %>%
+  pivot_longer(-compound_id, names_to = "ID", values_to = "Response") %>%
+  inner_join(dep_ros, by = c("ID" = "ID"))
+
+drug_stats <- drug_long %>%
+  group_by(compound_id) %>%
+  summarize(
+    Mean_High = mean(Response[Group == "High"], na.rm = TRUE),
+    Mean_Low  = mean(Response[Group == "Low"],  na.rm = TRUE),
+    Delta = Mean_High - Mean_Low,
+    P = wilcox.test(
+      Response[Group == "High"],
+      Response[Group == "Low"]
+    )$p.value
+  ) %>%
+  mutate(FDR = p.adjust(P, "fdr")) %>%
+  arrange(FDR)
+
+fwrite(drug_stats,
+       file.path(OUTDIR, "Fig_Drug_ROS_hits.tsv"),
+       sep = "\t")
+
+############################################################
+# PATHWAY ENRICHMENT (FGSEA)
+############################################################
+log_msg("Running FGSEA...")
+
+ranks <- ceres_stats$Delta
+names(ranks) <- ceres_stats$Gene
+ranks <- sort(ranks, decreasing = FALSE)
+
+msig <- msigdbr(species = "Homo sapiens", category = "H") %>%
+  split(x = .$gene_symbol, f = .$gs_name)
+
+fg <- fgsea(pathways = msig, stats = ranks, nperm = 5000)
+
+fwrite(fg,
+       file.path(OUTDIR, "Fig_Pathways_FGSEA.tsv"),
+       sep = "\t")
+
+############################################################
+# TCGA ↔ CERES (SOD2 AXIS)
+############################################################
+if (!is.null(SOD2_FILE)) {
+
+  log_msg("Integrating TCGA SOD2 with CERES...")
+
+  tcga_sod2 <- fread(SOD2_FILE)
+  tcga_sod2[, patient := substr(patient, 1, 12)]
+
+  sod2_vec <- tcga_sod2$SOD2
+  names(sod2_vec) <- tcga_sod2$patient
+
+  tcga_expr <- fread(DEPMAP_EXPR)
+
+  tcga_cor <- tcga_expr %>%
+    filter(Gene != "SOD2") %>%
+    rowwise() %>%
+    mutate(
+      R = cor(unlist(c_across(-Gene)), sod2_vec, method = "spearman"),
+      P = cor.test(unlist(c_across(-Gene)), sod2_vec, method = "spearman")$p.value
+    ) %>%
+    ungroup() %>%
+    mutate(FDR = p.adjust(P, "fdr"))
+
+  hits <- ceres_stats %>%
+    filter(FDR < 0.05, Delta < 0) %>%
+    inner_join(tcga_cor %>% filter(FDR < 0.05, R > 0.3), by = "Gene")
+
+  fwrite(hits,
+         file.path(OUTDIR, "Fig_TCGA_CERES_SOD2_hits.tsv"),
+         sep = "\t")
+}
+
+############################################################
+# DONE
+############################################################
+log_msg("PIPELINE FINISHED SUCCESSFULLY")

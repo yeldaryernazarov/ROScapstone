@@ -1,0 +1,163 @@
+############################################################
+# 4) Boxplots for specific genes across ROS-high vs ROS-low
+#
+# genes_of_interest <- c("SOD2", "AK4", "GPX4")
+############################################################
+
+rm(list = ls()); gc()
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(tibble)
+})
+
+############################################################
+# PATHS (edit if needed)
+############################################################
+
+CERES_FILE   <- "CRISPRGeneEffect.csv"
+MAP_FILE     <- "uniprot_hugo_entrez_id_mapping.csv"
+ROS_FILE     <- "ROS_MitoScores_ModelID.csv"  # DepMap_ID, ROS_MitoScore
+OUTDIR       <- "RESULTS"
+
+dir.create(OUTDIR, showWarnings = FALSE)
+
+############################################################
+# 1) Parameters
+############################################################
+
+genes_of_interest <- c("SOD2", "AK4", "GPX4")
+
+############################################################
+# 2) Load ROS scores and define High/Low groups
+############################################################
+
+ros <- fread(ROS_FILE, header = TRUE)
+colnames(ros) <- c("DepMap_ID", "ROS_MitoScore")
+
+q1 <- quantile(ros$ROS_MitoScore, 0.25, na.rm = TRUE)
+q4 <- quantile(ros$ROS_MitoScore, 0.75, na.rm = TRUE)
+
+ros <- ros %>%
+  mutate(
+    Group = case_when(
+      ROS_MitoScore <= q1 ~ "Low_Q1",
+      ROS_MitoScore >= q4 ~ "High_Q4",
+      TRUE                ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(Group))
+
+############################################################
+# 3) Load CERES dependency data (same conventions as MitoCarta script)
+############################################################
+
+ceres <- fread(CERES_FILE, header = TRUE)
+
+# Assume: 1st column = cell line identifier (DepMap_ID or name), rest = genes
+id_col <- names(ceres)[1]
+ceres_mat <- as.matrix(ceres[, -1, with = FALSE])
+rownames(ceres_mat) <- ceres[[id_col]]
+colnames(ceres_mat) <- names(ceres)[-1]
+
+# Heuristic: if more rows than columns, file is genes × lines → transpose
+if (nrow(ceres_mat) > ncol(ceres_mat)) {
+  ceres_mat <- t(ceres_mat)
+  message("Transposed CERES so that rows = cell lines, columns = genes.")
+}
+
+# Normalize gene identifiers to HUGO symbols (upper case), like in MitoCarta script
+genes_raw <- colnames(ceres_mat)
+genes_sym <- toupper(gsub("\\s*\\(.*\\)$", "", genes_raw))
+
+only_digits <- grepl("^[0-9]+$", genes_sym)
+if (any(only_digits) && file.exists(MAP_FILE)) {
+  map <- fread(MAP_FILE)
+  map <- map[!is.na(EntrezID) & !is.na(Symbol)]
+  map$EntrezID_chr <- as.character(as.integer(map$EntrezID))
+
+  genes_entrez <- genes_sym
+  genes_entrez[!only_digits] <- NA_character_
+
+  hugo_from_entrez <- map$Symbol[match(genes_entrez, map$EntrezID_chr)]
+
+  replace_idx <- which(!is.na(hugo_from_entrez))
+  if (length(replace_idx) > 0) {
+    genes_sym[replace_idx] <- toupper(hugo_from_entrez[replace_idx])
+  }
+}
+
+colnames(ceres_mat) <- genes_sym
+storage.mode(ceres_mat) <- "numeric"
+
+cr_long <- as.data.frame(ceres_mat) %>%
+  rownames_to_column("DepMap_ID") %>%
+  pivot_longer(
+    cols = -DepMap_ID,
+    names_to = "Gene",
+    values_to = "CERES"
+  )
+
+############################################################
+# 4) Subset to genes of interest and merge with ROS group
+############################################################
+
+subset_data <- cr_long %>%
+  filter(Gene %in% genes_of_interest) %>%
+  inner_join(ros, by = "DepMap_ID")
+
+subset_data$Gene <- factor(subset_data$Gene, levels = genes_of_interest)
+subset_data$Group <- factor(subset_data$Group, levels = c("Low_Q1", "High_Q4"))
+
+############################################################
+# 5) Boxplot: CERES by gene (all cell lines with ROS group)
+############################################################
+
+p_all <- ggplot(subset_data, aes(x = Gene, y = CERES)) +
+  geom_boxplot(outlier.size = 0.6, fill = "#4C72B0", alpha = 0.7) +
+  theme_minimal(base_size = 12) +
+  labs(
+    title = "CERES dependency for selected genes (all ROS-grouped cell lines)",
+    x     = "",
+    y     = "CERES score"
+  )
+
+ggsave(
+  filename = file.path(OUTDIR, "Fig_Boxplot_CERES_genes_all.png"),
+  plot     = p_all,
+  width    = 6,
+  height   = 4.5,
+  dpi      = 300
+)
+
+############################################################
+# 6) Boxplot: CERES by gene × ROS group
+############################################################
+
+p_group <- ggplot(subset_data, aes(x = Gene, y = CERES, fill = Group)) +
+  geom_boxplot(outlier.size = 0.6, alpha = 0.8, position = position_dodge(width = 0.7)) +
+  scale_fill_manual(values = c("Low_Q1" = "#2C7BB6", "High_Q4" = "#D7191C")) +
+  theme_minimal(base_size = 12) +
+  labs(
+    title = "CERES dependency for selected genes\nROS Low_Q1 vs High_Q4 cell lines",
+    x     = "",
+    y     = "CERES score",
+    fill  = "ROS group"
+  )
+
+ggsave(
+  filename = file.path(OUTDIR, "Fig_Boxplot_CERES_genes_by_ROS_group.png"),
+  plot     = p_group,
+  width    = 7,
+  height   = 4.5,
+  dpi      = 300
+)
+
+############################################################
+# DONE
+############################################################
+message("Saved boxplots for genes of interest into RESULTS.")
+

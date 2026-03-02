@@ -1,0 +1,52 @@
+library(data.table)
+library(dplyr)
+library(ggplot2)
+
+# -----------------------------
+# 1️⃣ Загружаем ROS_MitoScores.csv
+ros_file <- "ROS_MitoScores.csv"
+ros_df <- fread(ros_file)
+
+cat("Файл загружен. Размер:", dim(ros_df), "\n")
+print(head(ros_df))
+
+# -----------------------------
+# 2️⃣ Вектор score
+ros_scores <- as.numeric(ros_df[[2]])   # второй столбец с значениями
+names(ros_scores) <- ros_df[[1]]        # первый столбец — ID образца
+
+# -----------------------------
+# 3️⃣ Q1 и Q4
+q1 <- quantile(ros_scores, 0.25)
+q4 <- quantile(ros_scores, 0.75)
+
+low_samples  <- names(ros_scores)[ros_scores <= q1]
+high_samples <- names(ros_scores)[ros_scores >= q4]
+
+# -----------------------------
+# 4️⃣ log2FC
+mean_low  <- mean(ros_scores[low_samples])
+mean_high <- mean(ros_scores[high_samples])
+log2FC <- log2(mean_high / mean_low)
+cat("log2FC (High vs Low):", log2FC, "\n")
+
+# -----------------------------
+# 5️⃣ Подготовка данных для графика
+plot_df <- data.frame(
+  Sample = c(low_samples, high_samples),
+  Group  = c(rep("Low (Q1)", length(low_samples)), rep("High (Q4)", length(high_samples))),
+  Score  = c(ros_scores[low_samples], ros_scores[high_samples])
+)
+
+# -----------------------------
+# 6️⃣ Boxplot
+ggplot(plot_df, aes(x=Group, y=Score, fill=Group)) +
+  geom_boxplot(outlier.shape = NA, alpha=0.7) +
+  geom_jitter(width = 0.2, size=1) +
+  theme_minimal() +
+  labs(
+    title=paste("ROS_Mito ssGSEA Score\nlog2FC =", round(log2FC, 3)),
+    y="ssGSEA score"
+  ) +
+  scale_fill_manual(values=c("#1f77b4","#ff7f0e")) +
+  theme(legend.position="none")

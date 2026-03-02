@@ -1,0 +1,225 @@
+############################################################
+# 6) Correlation plots:
+#    CERES score vs ROS score / NRF2 activity / Immune signature
+#
+# For each gene, compute Spearman correlation between CERES and:
+#   - ROS_MitoScore
+#   - NRF2_score      (optional)
+#   - Immune_score    (optional)
+############################################################
+
+rm(list = ls()); gc()
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(tibble)
+})
+
+############################################################
+# PATHS (edit if needed)
+############################################################
+
+CERES_FILE   <- "CRISPRGeneEffect.csv"
+MAP_FILE     <- "uniprot_hugo_entrez_id_mapping.csv"
+ROS_FILE     <- "ROS_MitoScores_ModelID.csv"      # DepMap_ID, ROS_MitoScore
+NRF2_FILE    <- NULL                              # e.g. "NRF2_scores_ModelID.csv"
+IMMUNE_FILE  <- NULL                              # e.g. "Immune_scores_ModelID.csv"
+OUTDIR       <- "RESULTS"
+
+dir.create(OUTDIR, showWarnings = FALSE)
+
+############################################################
+# 1) Load CERES and scores (same conventions as MitoCarta script)
+############################################################
+
+ceres_raw <- fread(CERES_FILE)
+
+# Assume: 1st column = cell line identifier (DepMap_ID or name), rest = genes
+id_col <- names(ceres_raw)[1]
+ceres_mat <- as.matrix(ceres_raw[, -1, with = FALSE])
+rownames(ceres_mat) <- ceres_raw[[id_col]]
+colnames(ceres_mat) <- names(ceres_raw)[-1]
+
+# Heuristic: if more rows than columns, file is genes × lines → transpose
+if (nrow(ceres_mat) > ncol(ceres_mat)) {
+  ceres_mat <- t(ceres_mat)
+  message("Transposed CERES so that rows = cell lines, columns = genes.")
+}
+
+# Normalize gene identifiers to HUGO symbols (upper case), like in MitoCarta script
+genes_raw <- colnames(ceres_mat)
+genes_sym <- toupper(gsub("\\s*\\(.*\\)$", "", genes_raw))
+
+only_digits <- grepl("^[0-9]+$", genes_sym)
+if (any(only_digits) && file.exists(MAP_FILE)) {
+  map <- fread(MAP_FILE)
+  map <- map[!is.na(EntrezID) & !is.na(Symbol)]
+  map$EntrezID_chr <- as.character(as.integer(map$EntrezID))
+
+  genes_entrez <- genes_sym
+  genes_entrez[!only_digits] <- NA_character_
+
+  hugo_from_entrez <- map$Symbol[match(genes_entrez, map$EntrezID_chr)]
+
+  replace_idx <- which(!is.na(hugo_from_entrez))
+  if (length(replace_idx) > 0) {
+    genes_sym[replace_idx] <- toupper(hugo_from_entrez[replace_idx])
+  }
+}
+
+colnames(ceres_mat) <- genes_sym
+storage.mode(ceres_mat) <- "numeric"
+
+ceres <- as.data.frame(ceres_mat) %>%
+  rownames_to_column("DepMap_ID")
+
+ros <- fread(ROS_FILE)
+colnames(ros) <- c("DepMap_ID", "ROS_MitoScore")
+
+scores <- ros
+
+if (!is.null(NRF2_FILE)) {
+  nrf2 <- fread(NRF2_FILE)
+  colnames(nrf2) <- c("DepMap_ID", "NRF2_score")
+  scores <- merge(scores, nrf2, by = "DepMap_ID", all = FALSE)
+}
+
+if (!is.null(IMMUNE_FILE)) {
+  immu <- fread(IMMUNE_FILE)
+  colnames(immu) <- c("DepMap_ID", "Immune_score")
+  scores <- merge(scores, immu, by = "DepMap_ID", all = FALSE)
+}
+
+############################################################
+# 2) Long format: per gene × cell line
+############################################################
+
+ceres_long <- ceres %>%
+  pivot_longer(
+    cols = -DepMap_ID,
+    names_to = "Gene",
+    values_to = "CERES"
+  ) %>%
+  inner_join(scores, by = "DepMap_ID")
+
+############################################################
+# 3) Function to compute correlations for one score column
+############################################################
+
+cor_by_gene <- function(df, score_col) {
+  df %>%
+    group_by(Gene) %>%
+    summarise(
+      Rho = cor(CERES, .data[[score_col]], use = "pairwise.complete.obs", method = "spearman"),
+      P   = cor.test(CERES, .data[[score_col]], method = "spearman")$p.value,
+      .groups = "drop"
+    ) %>%
+    mutate(
+      FDR = p.adjust(P, method = "BH"),
+      Score = score_col
+    )
+}
+
+cor_list <- list()
+
+cor_list[["ROS_MitoScore"]] <- cor_by_gene(ceres_long, "ROS_MitoScore")
+
+if ("NRF2_score" %in% names(ceres_long)) {
+  cor_list[["NRF2_score"]] <- cor_by_gene(ceres_long, "NRF2_score")
+}
+
+if ("Immune_score" %in% names(ceres_long)) {
+  cor_list[["Immune_score"]] <- cor_by_gene(ceres_long, "Immune_score")
+}
+
+cor_res <- bind_rows(cor_list)
+
+fwrite(
+  cor_res,
+  file = file.path(OUTDIR, "CERES_correlations_vs_scores.tsv"),
+  sep  = "\t"
+)
+
+############################################################
+# 4) Example correlation scatterplots for selected genes
+############################################################
+
+genes_of_interest <- c("SOD2", "AK4", "GPX4")
+
+subset_df <- ceres_long %>%
+  filter(Gene %in% genes_of_interest)
+
+## CERES vs ROS_MitoScore
+
+if ("ROS_MitoScore" %in% names(subset_df)) {
+  p_ros <- ggplot(subset_df, aes(x = ROS_MitoScore, y = CERES, colour = Gene)) +
+    geom_point(alpha = 0.6) +
+    facet_wrap(~ Gene, scales = "free_y") +
+    theme_minimal(base_size = 12) +
+    labs(
+      title = "CERES vs ROS_MitoScore (selected genes)",
+      x     = "ROS_MitoScore",
+      y     = "CERES dependency"
+    )
+
+  ggsave(
+    filename = file.path(OUTDIR, "Fig_Correlation_CERES_vs_ROS_selected_genes.png"),
+    plot     = p_ros,
+    width    = 7,
+    height   = 5,
+    dpi      = 300
+  )
+}
+
+## CERES vs NRF2_score (if available)
+
+if ("NRF2_score" %in% names(subset_df)) {
+  p_nrf2 <- ggplot(subset_df, aes(x = NRF2_score, y = CERES, colour = Gene)) +
+    geom_point(alpha = 0.6) +
+    facet_wrap(~ Gene, scales = "free_y") +
+    theme_minimal(base_size = 12) +
+    labs(
+      title = "CERES vs NRF2 activity (selected genes)",
+      x     = "NRF2 activity score",
+      y     = "CERES dependency"
+    )
+
+  ggsave(
+    filename = file.path(OUTDIR, "Fig_Correlation_CERES_vs_NRF2_selected_genes.png"),
+    plot     = p_nrf2,
+    width    = 7,
+    height   = 5,
+    dpi      = 300
+  )
+}
+
+## CERES vs Immune_score (if available)
+
+if ("Immune_score" %in% names(subset_df)) {
+  p_immu <- ggplot(subset_df, aes(x = Immune_score, y = CERES, colour = Gene)) +
+    geom_point(alpha = 0.6) +
+    facet_wrap(~ Gene, scales = "free_y") +
+    theme_minimal(base_size = 12) +
+    labs(
+      title = "CERES vs Immune signature (selected genes)",
+      x     = "Immune signature score",
+      y     = "CERES dependency"
+    )
+
+  ggsave(
+    filename = file.path(OUTDIR, "Fig_Correlation_CERES_vs_Immune_selected_genes.png"),
+    plot     = p_immu,
+    width    = 7,
+    height   = 5,
+    dpi      = 300
+  )
+}
+
+############################################################
+# DONE
+############################################################
+message("Correlation tables and example scatterplots saved into RESULTS.")
+

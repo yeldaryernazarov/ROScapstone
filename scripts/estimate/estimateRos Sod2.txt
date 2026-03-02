@@ -1,0 +1,87 @@
+############################################################
+# ESTIMATE Immune/Stromal Scores: Максимальное использование ПК
+############################################################
+
+rm(list=ls()); gc()
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(estimate)
+  library(future)
+  library(future.apply)
+})
+
+############################################################
+# 1) Настройка параллелизма
+############################################################
+# Используем все доступные ядра
+available_cores <- parallel::detectCores()
+plan(multisession, workers = available_cores)
+message("Используем ядер: ", available_cores)
+
+############################################################
+# 2) Пути к файлам
+############################################################
+expr_file <- "tcga_RSEM_gene_tpm"
+ros_file  <- "TCGA_Q25Q75_patients_ROS_ssGSEA.tsv"
+sod2_file <- "TCGA_Q25Q75_patients_SOD2.tsv"
+
+out_scores <- "TCGA_ESTIMATE_scores.gct"
+out_merged_ros  <- "TCGA_ESTIMATE_ROS_survival.tsv"
+out_merged_sod2 <- "TCGA_ESTIMATE_SOD2_survival.tsv"
+
+############################################################
+# 3) Чтение матрицы экспрессии
+############################################################
+message("Чтение матрицы экспрессии...")
+expr <- fread(expr_file, sep="\t")  # если табуляция, иначе изменить sep
+colnames(expr) <- make.unique(colnames(expr))  # уникальные TCGA ID
+
+# Добавляем колонку Description для GCT
+expr[, Description := NA]
+setcolorder(expr, c("NAME", "Description", setdiff(names(expr), c("NAME", "Description"))))
+
+# Запись GCT с двумя заголовками (обязательный формат для ESTIMATE)
+gct_file <- "expr_unique.gct"
+cat("#1.2\n", file=gct_file)
+cat(nrow(expr), "\t", ncol(expr)-2, "\n", file=gct_file, append=TRUE)
+fwrite(expr, gct_file, sep="\t", quote=FALSE, row.names=FALSE, col.names=TRUE, append=TRUE)
+
+############################################################
+# 4) Запуск ESTIMATE с параллелизмом
+############################################################
+message("Фильтрация общих генов...")
+filterCommonGenes(input.f=gct_file, output.f=gct_file, id="GeneSymbol")
+
+message("Вычисление ESTIMATE score (максимальное использование CPU)...")
+# Параллельная версия
+future_lapply(1:available_cores, function(x) {
+  estimateScore(input.ds=gct_file, output.ds=out_scores, platform="illumina")
+})
+
+############################################################
+# 5) Чтение результатов ESTIMATE
+############################################################
+scores <- fread(out_scores, skip=2)
+scores_long <- melt(scores, id.vars="NAME", variable.name="patient", value.name="score")
+
+############################################################
+# 6) Merge с ROS
+############################################################
+ros <- fread(ros_file)
+ros[, patient := substr(patient, 1, 12)]
+merged_ros <- merge(scores_long, ros, by="patient", all.x=TRUE)
+fwrite(merged_ros, out_merged_ros, sep="\t")
+
+############################################################
+# 7) Merge с SOD2
+############################################################
+sod2 <- fread(sod2_file)
+sod2[, patient := substr(patient, 1, 12)]
+merged_sod2 <- merge(scores_long, sod2, by="patient", all.x=TRUE)
+fwrite(merged_sod2, out_merged_sod2, sep="\t")
+
+############################################################
+# DONE
+############################################################
+message("Готово! Все ядра использованы, файлы ROS и SOD2 созданы.")

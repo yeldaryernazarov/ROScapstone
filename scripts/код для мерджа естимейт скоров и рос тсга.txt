@@ -1,0 +1,61 @@
+############################################################
+# Merge ROS ssGSEA with ESTIMATE scores and Hot/Cold info
+############################################################
+
+rm(list=ls()); gc()
+
+suppressPackageStartupMessages({
+  library(data.table)
+})
+
+############################################################
+# PATHS
+############################################################
+ros_file  <- "TCGA_Q25Q75_patients_ROS_ssGSEA.tsv"
+hot_file  <- "TCGA_all_patients_hot.tsv"
+cold_file <- "TCGA_all_patients_cold.tsv"
+out_file  <- "TCGA_patients_ROS_ESTIMATE.tsv"
+
+############################################################
+# 1) Load ROS data
+############################################################
+dt_ros <- fread(ros_file)
+dt_ros[, patient := substr(patient, 1, 12)]  # оставляем только первые 12 символов
+
+# Проверка колонок
+stopifnot(all(c("patient", "ROS_ssGSEA", "ROS_z", "ROS_status") %in% colnames(dt_ros)))
+
+############################################################
+# 2) Load Hot / Cold ESTIMATE data
+############################################################
+dt_hot  <- fread(hot_file)
+dt_hot[, ImmuneStatus := "Hot"]
+
+dt_cold <- fread(cold_file)
+dt_cold[, ImmuneStatus := "Cold"]
+
+# объединяем Hot + Cold
+dt_est <- rbindlist(list(dt_hot, dt_cold), use.names = TRUE, fill = TRUE)
+
+# стандартизируем имена пациентов
+dt_est[, patient := substr(Patient, 1, 12)]
+
+############################################################
+# 3) Merge ROS + ESTIMATE
+############################################################
+dt_merged <- merge(
+  dt_ros,
+  dt_est[, .(patient, StromalScore, ImmuneScore, ESTIMATEScore, ImmuneStatus)],
+  by = "patient",
+  all.x = TRUE
+)
+
+############################################################
+# 4) Проверка и сохранение
+############################################################
+message("Total patients in merged table: ", nrow(dt_merged))
+message("Hot / Cold distribution:")
+print(table(dt_merged$ImmuneStatus))
+
+fwrite(dt_merged, out_file, sep = "\t")
+message("Saved merged file as: ", out_file)

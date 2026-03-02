@@ -1,0 +1,129 @@
+############################################################
+# ROS / MitoScore ssGSEA — GSVA 2.5.15 с бэкграунд нормализацией
+############################################################
+
+rm(list=ls()); gc()
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(readxl)
+  library(GSVA)
+})
+
+# -----------------------------
+# 1️⃣ Пути к файлам
+# -----------------------------
+expr_file      <- "OmicsExpressionTPMLogp1HumanProteinCodingGenes.csv"
+mitocarta_file <- "Human.MitoCarta3.0.xlsx"
+map_file       <- "uniprot_hugo_entrez_id_mapping.csv"
+
+# -----------------------------
+# 2️⃣ Загружаем RNA-seq
+# -----------------------------
+cat("Loading expression data...\n")
+expr <- fread(expr_file)
+
+cat("Expression dimensions (rows x cols):", dim(expr), "\n")
+
+expr_mat <- as.matrix(expr[, -c(1:4), with=FALSE])
+expr_mat <- apply(expr_mat, 2, function(x) as.numeric(as.character(x)))
+cat("Converted expr to numeric matrix. NA count:", sum(is.na(expr_mat)), "\n")
+
+# -----------------------------
+# 3️⃣ Разбираем имена генов из колонок (EntrezID)
+# -----------------------------
+gene_names <- colnames(expr_mat)
+entrez_ids <- sub(".*\\((\\d+)\\)$", "\\1", gene_names)
+cat("First 10 EntrezIDs:\n")
+print(head(entrez_ids, 10))
+
+# -----------------------------
+# 4️⃣ Mapping Entrez -> HUGO
+# -----------------------------
+map <- fread(map_file)
+map <- map[!is.na(EntrezID) & !is.na(Symbol)]
+
+hugo_symbols <- map$Symbol[match(entrez_ids, map$EntrezID)]
+hugo_symbols <- toupper(hugo_symbols)
+cat("Mapped to HUGO symbols. NA count:", sum(is.na(hugo_symbols)), "\n")
+cat("First 10 HUGO symbols:\n")
+print(head(hugo_symbols, 10))
+
+# Присвоение в colnames
+colnames(expr_mat) <- hugo_symbols
+
+# Убираем столбцы без маппинга
+valid_cols <- !is.na(colnames(expr_mat)) & colnames(expr_mat) != ""
+expr_mat <- expr_mat[, valid_cols, drop=FALSE]
+cat("Columns after mapping filter:", ncol(expr_mat), "\n")
+
+# -----------------------------
+# 5️⃣ Фильтруем молчащие гены (all-zero)
+# -----------------------------
+nonzero_cols <- colSums(expr_mat) > 0
+expr_mat <- expr_mat[, nonzero_cols, drop=FALSE]
+cat("Columns after removing all-zero genes:", ncol(expr_mat), "\n")
+
+# -----------------------------
+# 6️⃣ Загружаем MitoCarta
+# -----------------------------
+cat("Loading MitoCarta…\n")
+mito <- read_excel(mitocarta_file, sheet=1)
+mito_genes <- toupper(unique(mito$Symbol))
+cat("Total MitoCarta genes:", length(mito_genes), "\n")
+
+# -----------------------------
+# 7️⃣ Фильтр митохондриальных генов
+# -----------------------------
+common_genes <- intersect(colnames(expr_mat), mito_genes)
+expr_mito <- expr_mat[, common_genes, drop=FALSE]
+cat("Mito genes in matrix:", length(common_genes), "\n")
+if(length(common_genes) < 5) stop("Too few mito genes matched — check mapping!")
+
+# -----------------------------
+# 8️⃣ Проверка на NA / бесконечности
+# -----------------------------
+expr_mito[!is.finite(expr_mito)] <- 0
+na_count <- sum(!is.finite(expr_mito))
+cat("Non-finite values in mito matrix:", na_count, "\n")
+
+# -----------------------------
+# 9️⃣ Создаем gene sets для ssGSEA
+# -----------------------------
+gene_sets <- list(ROS_Mito = common_genes)
+
+# создаем "background" набор — все остальные гены
+bg_genes <- setdiff(colnames(expr_mat), common_genes)
+gene_sets_full <- c(gene_sets, list(BG = bg_genes))
+cat("Number of genes in ROS_Mito:", length(gene_sets$ROS_Mito), "\n")
+cat("Number of genes in BG:", length(bg_genes), "\n")
+
+# -----------------------------
+# 🔟 ssGSEA: создаем объект параметров
+# -----------------------------
+cat("Building ssGSEA parameter object…\n")
+param <- ssgseaParam(
+  exprData = t(expr_mat),  # transpose: samples × genes
+  geneSets = gene_sets_full,
+  normalize = TRUE
+)
+
+# -----------------------------
+# 1️⃣1️⃣ Запуск ssGSEA
+# -----------------------------
+cat("Running ssGSEA…\n")
+scores_full <- gsva(param)
+cat("ssGSEA finished. Dimensions:", dim(scores_full), "\n")
+
+# -----------------------------
+# 1️⃣2️⃣ Извлекаем ROS_Mito score
+# -----------------------------
+ros_scores <- scores_full["ROS_Mito", ]
+cat("First 10 ROS_Mito scores:\n")
+print(head(ros_scores, 10))
+
+# -----------------------------
+# 1️⃣3️⃣ Сохраняем результат
+# -----------------------------
+write.csv(ros_scores, "ROS_MitoScores.csv", quote=FALSE)
+cat("Saved ROS_MitoScores.csv\n")

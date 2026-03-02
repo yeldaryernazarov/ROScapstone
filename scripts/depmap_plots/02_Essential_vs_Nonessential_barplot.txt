@@ -1,0 +1,152 @@
+############################################################
+# 2) Essential vs Non-essential classification barplot
+#
+# Uses:
+#   - CRISPR_dependency_ROS_Q1_vs_Q4.csv (from CRISPR.txt)
+#   - essential_genes.txt
+#   - nonessential_genes.txt
+############################################################
+
+rm(list = ls()); gc()
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(dplyr)
+  library(ggplot2)
+})
+
+############################################################
+# PATHS (edit if needed)
+############################################################
+
+DEP_RESULTS   <- "CRISPR_dependency_ROS_Q1_vs_Q4.csv"  # output table with per-gene stats
+ESSENTIAL_TXT <- "essential_genes.txt"
+NONESS_TXT    <- "nonessential_genes.txt"
+OUTDIR        <- "RESULTS"
+
+dir.create(OUTDIR, showWarnings = FALSE)
+
+############################################################
+# 1) Load tables
+############################################################
+
+res <- fread(DEP_RESULTS)
+
+ess_raw  <- fread(ESSENTIAL_TXT, header = FALSE)$V1
+noness_raw <- fread(NONESS_TXT, header = FALSE)$V1
+
+# Drop comment lines starting with '#'
+ess_genes <- ess_raw[!grepl("^\\s*#", ess_raw)]
+noness_genes <- noness_raw[!grepl("^\\s*#", noness_raw)]
+
+############################################################
+# 1b) Normalize gene symbols to match CRISPR table
+#     (strip parentheses like 'SDHB (6390)', uppercase, trim)
+############################################################
+
+norm_symbol <- function(x) {
+  x <- as.character(x)
+  x <- gsub("\\s*\\(.*\\)$", "", x)  # remove ' (1234)' suffix
+  x <- trimws(toupper(x))
+  x
+}
+
+res <- res %>%
+  mutate(Gene_norm = norm_symbol(Gene))
+
+ess_genes_norm   <- norm_symbol(ess_genes)
+noness_genes_norm <- norm_symbol(noness_genes)
+
+############################################################
+# 2) Annotate essentiality class
+############################################################
+
+res <- res %>%
+  mutate(
+    Essentiality = case_when(
+      Gene_norm %in% ess_genes_norm    ~ "Essential",
+      Gene_norm %in% noness_genes_norm ~ "Non-essential",
+      TRUE                             ~ "Other/Unknown"
+    )
+  )
+
+############################################################
+# 3) Simple barplot: counts of genes by essentiality
+############################################################
+
+count_df <- res %>%
+  count(Essentiality, name = "N") %>%
+  mutate(Essentiality = factor(Essentiality,
+                               levels = c("Essential", "Non-essential", "Other/Unknown")))
+
+p_bar <- ggplot(count_df, aes(x = Essentiality, y = N, fill = Essentiality)) +
+  geom_col(width = 0.7) +
+  geom_text(aes(label = N), vjust = -0.3, size = 4) +
+  scale_fill_manual(
+    values = c(
+      "Essential"     = "#D7191C",
+      "Non-essential" = "#2C7BB6",
+      "Other/Unknown" = "grey70"
+    )
+  ) +
+  theme_minimal(base_size = 12) +
+  labs(
+    title = "Gene counts by essentiality (all genes in CRISPR dependency table)",
+    x     = "",
+    y     = "Number of genes",
+    fill  = "Class"
+  )
+
+ggsave(
+  filename = file.path(OUTDIR, "Fig_Essential_vs_Nonessential_counts.png"),
+  plot     = p_bar,
+  width    = 6,
+  height   = 4.5,
+  dpi      = 300
+)
+
+############################################################
+# 4) Optional: restrict to significant dependency hits
+############################################################
+
+sig_res <- res %>%
+  filter(adj_p < 0.05)
+
+if (nrow(sig_res) > 0) {
+  sig_count_df <- sig_res %>%
+    count(Essentiality, name = "N") %>%
+    mutate(Essentiality = factor(Essentiality,
+                                 levels = c("Essential", "Non-essential", "Other/Unknown")))
+
+  p_bar_sig <- ggplot(sig_count_df, aes(x = Essentiality, y = N, fill = Essentiality)) +
+    geom_col(width = 0.7) +
+    geom_text(aes(label = N), vjust = -0.3, size = 4) +
+    scale_fill_manual(
+      values = c(
+        "Essential"     = "#D7191C",
+        "Non-essential" = "#2C7BB6",
+        "Other/Unknown" = "grey70"
+      )
+    ) +
+    theme_minimal(base_size = 12) +
+    labs(
+      title = "Significant dependency hits (adj p < 0.05)",
+      x     = "",
+      y     = "Number of genes",
+      fill  = "Class"
+    )
+
+  ggsave(
+    filename = file.path(OUTDIR, "Fig_Essential_vs_Nonessential_counts_significant.png"),
+    plot     = p_bar_sig,
+    width    = 6,
+    height   = 4.5,
+    dpi      = 300
+  )
+}
+
+############################################################
+# DONE
+############################################################
+message("Saved barplots for Essential vs Non-essential gene counts into RESULTS.")
+
