@@ -1,0 +1,189 @@
+############################################################
+# 5) Heatmap: Genes × Cell lines (ROS-high vs ROS-low)
+#
+# Uses same ROS grouping as in CRISPR / boxplot scripts.
+############################################################
+
+rm(list = ls()); gc()
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(dplyr)
+  library(tidyr)
+  library(pheatmap)
+  library(tibble)
+})
+
+############################################################
+# PATHS (edit if needed)
+############################################################
+
+CERES_FILE <- "CRISPRGeneEffect.csv"
+MAP_FILE   <- "uniprot_hugo_entrez_id_mapping.csv"
+ROS_FILE   <- "ROS_MitoScores_ModelID.csv"  # DepMap_ID, ROS_MitoScore
+OUTDIR     <- "RESULTS"
+
+dir.create(OUTDIR, showWarnings = FALSE)
+
+############################################################
+# 1) Parameters
+############################################################
+
+# You can set this to your genes of interest, or leave NULL
+genes_of_interest <- c("SOD2", "AK4", "GPX4")
+
+# How many top differential genes to take (if NULL genes_of_interest only)
+TOP_N <- 25
+
+############################################################
+# 2) Load ROS scores and define High/Low groups
+############################################################
+
+ros_raw <- fread(ROS_FILE, header = TRUE)
+colnames(ros_raw) <- c("DepMap_ID", "ROS_MitoScore")
+
+# Collapse to one row per DepMap_ID (handle duplicated IDs robustly)
+ros <- ros_raw %>%
+  group_by(DepMap_ID) %>%
+  summarise(
+    ROS_MitoScore = mean(ROS_MitoScore, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+q1 <- quantile(ros$ROS_MitoScore, 0.25, na.rm = TRUE)
+q4 <- quantile(ros$ROS_MitoScore, 0.75, na.rm = TRUE)
+
+ros <- ros %>%
+  mutate(
+    Group = case_when(
+      ROS_MitoScore <= q1 ~ "Low_Q1",
+      ROS_MitoScore >= q4 ~ "High_Q4",
+      TRUE                ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(Group))
+
+############################################################
+# 3) Load CERES and restrict to ROS-grouped cell lines
+############################################################
+
+ceres <- fread(CERES_FILE)
+
+# Assume: 1st column = cell line identifier (DepMap_ID or name), rest = genes
+id_col <- names(ceres)[1]
+ceres_mat <- as.matrix(ceres[, -1, with = FALSE])
+rownames(ceres_mat) <- ceres[[id_col]]
+colnames(ceres_mat) <- names(ceres)[-1]
+
+# Heuristic: if more rows than columns, file is genes × lines → transpose
+if (nrow(ceres_mat) > ncol(ceres_mat)) {
+  ceres_mat <- t(ceres_mat)
+  message("Transposed CERES so that rows = cell lines, columns = genes.")
+}
+
+# Normalize gene identifiers to HUGO symbols (upper case), like in MitoCarta script
+genes_raw <- colnames(ceres_mat)
+genes_sym <- toupper(gsub("\\s*\\(.*\\)$", "", genes_raw))
+
+only_digits <- grepl("^[0-9]+$", genes_sym)
+if (any(only_digits) && file.exists(MAP_FILE)) {
+  map <- fread(MAP_FILE)
+  map <- map[!is.na(EntrezID) & !is.na(Symbol)]
+  map$EntrezID_chr <- as.character(as.integer(map$EntrezID))
+
+  genes_entrez <- genes_sym
+  genes_entrez[!only_digits] <- NA_character_
+
+  hugo_from_entrez <- map$Symbol[match(genes_entrez, map$EntrezID_chr)]
+
+  replace_idx <- which(!is.na(hugo_from_entrez))
+  if (length(replace_idx) > 0) {
+    genes_sym[replace_idx] <- toupper(hugo_from_entrez[replace_idx])
+  }
+}
+
+colnames(ceres_mat) <- genes_sym
+storage.mode(ceres_mat) <- "numeric"
+
+ceres_long <- as.data.frame(ceres_mat) %>%
+  rownames_to_column("DepMap_ID") %>%
+  inner_join(ros, by = "DepMap_ID") %>%
+  select(-ROS_MitoScore) %>%
+  pivot_longer(
+    cols = -c(DepMap_ID, Group),
+    names_to = "Gene",
+    values_to = "CERES"
+  )
+
+############################################################
+# 4) Choose genes for the heatmap
+############################################################
+
+if (!is.null(genes_of_interest) && length(genes_of_interest) > 0) {
+  goi <- genes_of_interest
+} else {
+  # Rank by difference High vs Low and take TOP_N
+  stats_df <- ceres_long %>%
+    group_by(Gene, Group) %>%
+    summarise(meanCERES = mean(CERES, na.rm = TRUE), .groups = "drop") %>%
+    tidyr::pivot_wider(names_from = Group, values_from = meanCERES) %>%
+    mutate(diff = High_Q4 - Low_Q1) %>%
+    arrange(diff)
+
+  goi <- stats_df %>%
+    slice_head(n = TOP_N) %>%
+    pull(Gene)
+}
+
+heat_df <- ceres_long %>%
+  filter(Gene %in% goi) %>%
+  select(Gene, DepMap_ID, CERES) %>%
+  pivot_wider(
+    names_from  = DepMap_ID,
+    values_from = CERES,
+    values_fn   = list(CERES = mean),
+    values_fill = NA_real_
+  ) %>%
+  as.data.frame()
+
+rownames(heat_df) <- heat_df$Gene
+heat_df$Gene <- NULL
+
+############################################################
+# 5) Annotation for columns (cell lines)
+############################################################
+
+annot_col <- ros %>%
+  select(DepMap_ID, Group) %>%
+  as.data.frame()
+
+rownames(annot_col) <- annot_col$DepMap_ID
+annot_col$DepMap_ID <- NULL
+
+common_cols <- intersect(colnames(heat_df), rownames(annot_col))
+heat_df     <- heat_df[, common_cols, drop = FALSE]
+annot_col   <- annot_col[common_cols, , drop = FALSE]
+
+############################################################
+# 6) Draw heatmap (and save to file via pheatmap)
+############################################################
+
+pheatmap(
+  mat               = as.matrix(heat_df),
+  scale             = "row",
+  clustering_method = "ward.D2",
+  annotation_col    = annot_col,
+  show_rownames     = TRUE,
+  show_colnames     = FALSE,
+  fontsize_row      = 8,
+  main              = "CERES dependency heatmap (ROS High_Q4 vs Low_Q1 cell lines)",
+  filename          = file.path(OUTDIR, "Fig_Heatmap_CERES_genes_by_cellline_ROS.png"),
+  width             = 8,
+  height            = 6
+)
+
+############################################################
+# DONE
+############################################################
+message("Heatmap for CERES genes × cell lines (ROS-grouped) drawn.")
+

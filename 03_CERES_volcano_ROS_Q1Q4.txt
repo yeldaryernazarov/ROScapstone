@@ -1,0 +1,99 @@
+############################################################
+# 3) Volcano plot for ROS-high vs ROS-low cell lines
+#
+# Uses CRISPR_dependency_ROS_Q1_vs_Q4.csv from CRISPR.txt
+# x-axis: mean CERES difference (High_Q4 - Low_Q1)
+# y-axis: -log10(adj_p)
+############################################################
+
+rm(list = ls()); gc()
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(dplyr)
+  library(ggplot2)
+  library(ggrepel)
+})
+
+############################################################
+# PATHS (edit if needed)
+############################################################
+
+DEP_RESULTS <- "CRISPR_dependency_ROS_Q1_vs_Q4.csv"
+OUTDIR      <- "RESULTS"
+
+dir.create(OUTDIR, showWarnings = FALSE)
+
+############################################################
+# 1) Load table
+############################################################
+
+res <- fread(DEP_RESULTS)
+
+stopifnot(all(c("Gene", "diff", "adj_p") %in% names(res)))
+
+res <- res %>%
+  mutate(
+    minus_log10_adj_p = -log10(adj_p),
+    Signif = case_when(
+      adj_p < 0.05 & diff <  0 ~ "High ROS more essential",
+      adj_p < 0.05 & diff >  0 ~ "Low ROS more essential",
+      TRUE                     ~ "NS"
+    )
+  )
+
+############################################################
+# 2) Volcano plot
+############################################################
+
+genes_to_label <- c("SOD2", "AK4", "GPX4")
+
+p_volcano <- ggplot(res, aes(x = diff, y = minus_log10_adj_p)) +
+  geom_point(aes(colour = Signif), alpha = 0.6, size = 1.2) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", colour = "grey40") +
+  geom_vline(xintercept = 0, linetype = "dotted", colour = "grey40") +
+  scale_colour_manual(
+    values = c(
+      "High ROS more essential" = "#D7191C",
+      "Low ROS more essential"  = "#2C7BB6",
+      "NS"                      = "grey70"
+    )
+  ) +
+  theme_minimal(base_size = 12) +
+  labs(
+    title = "Volcano: CERES dependency (High ROS vs Low ROS cell lines)",
+    x     = "Mean CERES difference (High_Q4 - Low_Q1)",
+    y     = "-log10(adj p)",
+    colour = ""
+  )
+
+# Label selected genes
+label_df <- res %>%
+  filter(Gene %in% genes_to_label)
+
+if (nrow(label_df) > 0) {
+  p_volcano <- p_volcano +
+    ggrepel::geom_text_repel(
+      data = label_df,
+      aes(label = Gene),
+      size = 3,
+      max.overlaps = 50,
+      box.padding = 0.3,
+      point.padding = 0.2,
+      seed = 123
+    )
+}
+
+ggsave(
+  filename = file.path(OUTDIR, "Fig_CERES_volcano_ROS_Q1Q4.png"),
+  plot     = p_volcano,
+  width    = 7,
+  height   = 5,
+  dpi      = 300
+)
+
+############################################################
+# DONE
+############################################################
+message("Saved volcano plot of CERES dependency (High vs Low ROS) into RESULTS.")
+

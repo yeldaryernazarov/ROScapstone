@@ -1,0 +1,197 @@
+############################################################
+# 1) Distribution of CERES scores (SOD2 / AK4 vs global)
+#    - Violin + density plots
+############################################################
+
+rm(list = ls()); gc()
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(tibble)
+})
+
+############################################################
+# PATHS (edit if needed)
+############################################################
+
+CERES_FILE   <- "CRISPRGeneEffect.csv"          # DepMap CERES matrix (Gene × cell lines or DepMap_ID × genes)
+MAP_FILE     <- "uniprot_hugo_entrez_id_mapping.csv"  # used if CERES columns are Entrez IDs
+OUTDIR       <- "RESULTS"
+
+dir.create(OUTDIR, showWarnings = FALSE)
+
+############################################################
+# 1) Load CERES dependency matrix (same conventions as MitoCarta script)
+############################################################
+
+ceres <- fread(CERES_FILE)
+
+# Assume: 1st column = cell line identifier (DepMap_ID or name), rest = genes
+id_col <- names(ceres)[1]
+ceres_mat <- as.matrix(ceres[, -1, with = FALSE])
+rownames(ceres_mat) <- ceres[[id_col]]
+colnames(ceres_mat) <- names(ceres)[-1]
+
+# Heuristic: if more rows than columns, file is genes × lines → transpose
+if (nrow(ceres_mat) > ncol(ceres_mat)) {
+  ceres_mat <- t(ceres_mat)
+  message("Transposed CERES so that rows = cell lines, columns = genes.")
+}
+
+# Normalize gene identifiers to HUGO symbols (upper case), like in MitoCarta script
+genes_raw <- colnames(ceres_mat)
+genes_sym <- toupper(gsub("\\s*\\(.*\\)$", "", genes_raw))
+
+only_digits <- grepl("^[0-9]+$", genes_sym)
+if (any(only_digits) && file.exists(MAP_FILE)) {
+  map <- fread(MAP_FILE)
+  map <- map[!is.na(EntrezID) & !is.na(Symbol)]
+  map$EntrezID_chr <- as.character(as.integer(map$EntrezID))
+
+  genes_entrez <- genes_sym
+  genes_entrez[!only_digits] <- NA_character_
+
+  hugo_from_entrez <- map$Symbol[match(genes_entrez, map$EntrezID_chr)]
+
+  replace_idx <- which(!is.na(hugo_from_entrez))
+  if (length(replace_idx) > 0) {
+    genes_sym[replace_idx] <- toupper(hugo_from_entrez[replace_idx])
+  }
+}
+
+colnames(ceres_mat) <- genes_sym
+storage.mode(ceres_mat) <- "numeric"
+
+# Long format: cell line × gene
+dt_long <- as.data.frame(ceres_mat) %>%
+  rownames_to_column("DepMap_ID") %>%
+  pivot_longer(
+    cols = -DepMap_ID,
+    names_to = "Gene",
+    values_to = "CERES"
+  )
+
+############################################################
+# 2) Mark genes of interest
+############################################################
+
+genes_of_interest <- c("SOD2", "AK4")
+
+dt_long <- dt_long %>%
+  mutate(
+    Gene_class = case_when(
+      Gene %in% genes_of_interest ~ Gene,
+      TRUE                        ~ "Other"
+    )
+  )
+
+############################################################
+# 3) Global density plot of CERES scores
+############################################################
+
+goi_means <- dt_long %>%
+  filter(Gene %in% genes_of_interest) %>%
+  group_by(Gene) %>%
+  summarize(mu = mean(CERES, na.rm = TRUE), .groups = "drop")
+
+p_density <- ggplot(dt_long, aes(x = CERES)) +
+  geom_density(fill = "grey80", colour = "grey40")
+
+if (nrow(goi_means) > 0) {
+  p_density <- p_density +
+    geom_vline(
+      data = goi_means,
+      aes(xintercept = mu, colour = Gene),
+      linetype = "dashed",
+      linewidth = 0.7
+    ) +
+    scale_colour_manual(values = c("SOD2" = "#D7191C", "AK4" = "#2C7BB6")) +
+    labs(colour = "Gene")
+}
+
+p_density <- p_density +
+  theme_minimal(base_size = 12) +
+  labs(
+    title = "Global CERES score distribution with SOD2 / AK4 means",
+    x     = "CERES score (dependency)",
+    y     = "Density"
+  )
+
+ggsave(
+  filename = file.path(OUTDIR, "Fig_CERES_density_SOD2_AK4.png"),
+  plot     = p_density,
+  width    = 7,
+  height   = 5,
+  dpi      = 300
+)
+
+############################################################
+# 4) Violin plot: SOD2 / AK4 vs all other genes
+############################################################
+
+set.seed(1L)
+
+# 1) выбрать подмножество «Other» генов (размер задаём отдельно, чтобы `slice_sample()` видел константу)
+other_genes_tbl <- dt_long %>%
+  filter(Gene_class == "Other") %>%
+  distinct(Gene)
+
+n_other_genes <- nrow(other_genes_tbl)
+n_sample <- min(500L, n_other_genes)
+
+if (n_sample > 0) {
+  other_genes_sampled <- other_genes_tbl %>%
+    slice_sample(n = n_sample) %>%
+    pull(Gene)
+
+  # 2) собрать датафрейм для виолина
+  violin_df <- dt_long %>%
+    filter(
+      Gene %in% genes_of_interest | Gene %in% other_genes_sampled
+    ) %>%
+    mutate(
+      Gene_class = factor(Gene_class, levels = c("Other", "SOD2", "AK4"))
+    )
+} else {
+  # запасной вариант: если по какой-то причине нет "Other" генов
+  violin_df <- dt_long %>%
+    filter(Gene %in% genes_of_interest) %>%
+    mutate(
+      Gene_class = factor(Gene_class, levels = c("SOD2", "AK4"))
+    )
+}
+
+p_violin <- ggplot(violin_df, aes(x = Gene_class, y = CERES, fill = Gene_class)) +
+  geom_violin(trim = TRUE, alpha = 0.7) +
+  geom_boxplot(width = 0.15, outlier.size = 0.5, colour = "black", alpha = 0.7) +
+  scale_fill_manual(
+    values = c(
+      "Other" = "grey80",
+      "SOD2"  = "#D7191C",
+      "AK4"   = "#2C7BB6"
+    )
+  ) +
+  theme_minimal(base_size = 12) +
+  labs(
+    title = "CERES score distribution: SOD2 / AK4 vs other genes",
+    x     = "",
+    y     = "CERES score (dependency)",
+    fill  = ""
+  )
+
+ggsave(
+  filename = file.path(OUTDIR, "Fig_CERES_violin_SOD2_AK4.png"),
+  plot     = p_violin,
+  width    = 6,
+  height   = 5,
+  dpi      = 300
+)
+
+############################################################
+# DONE
+############################################################
+message("Saved CERES density and violin plots for SOD2 / AK4 into RESULTS.")
+
